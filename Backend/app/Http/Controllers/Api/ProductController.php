@@ -50,6 +50,7 @@ class ProductController extends Controller
                     'user_id' => $request->user()->id,
                     'type' => 'in',
                     'quantity' => $initialStock,
+                    'delta' => $initialStock,
                     'quantity_after' => $initialStock,
                     'reason' => 'Initial stock',
                 ]);
@@ -58,7 +59,7 @@ class ProductController extends Controller
             return $product;
         });
         $audit->record($request, 'created', 'product', $product->id);
-        if ($product->stock_quantity <= $product->minimum_stock_level) {
+        if ($product->minimum_stock_level > 0 && $product->stock_quantity <= $product->minimum_stock_level) {
             $notifier->notifyAdministrators('low_stock', 'Product '.$product->name.' is low in stock.', ['product_id' => $product->id]);
         }
 

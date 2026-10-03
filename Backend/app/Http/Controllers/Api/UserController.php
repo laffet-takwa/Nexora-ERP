@@ -4,8 +4,10 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Services\AdministratorGuard;
 use App\Services\AuditLogger;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rules\Password;
 
 class UserController extends Controller
@@ -42,7 +44,7 @@ class UserController extends Controller
         return $user->only(['id', 'name', 'email', 'role', 'is_active', 'created_at', 'updated_at']);
     }
 
-    public function update(Request $request, User $user, AuditLogger $audit)
+    public function update(Request $request, User $user, AuditLogger $audit, AdministratorGuard $guard)
     {
         $data = $request->validate([
             'name' => ['sometimes', 'required', 'string', 'max:255'],
@@ -51,13 +53,20 @@ class UserController extends Controller
             'is_active' => ['sometimes', 'boolean'],
             'password' => ['sometimes', 'required', 'confirmed', Password::defaults()],
         ]);
-        $disablingSelf = array_key_exists('is_active', $data) && ! filter_var($data['is_active'], FILTER_VALIDATE_BOOLEAN);
-        abort_if($user->is($request->user()) && ($disablingSelf || ($data['role'] ?? $user->role) !== 'administrator'), 422, 'You cannot disable or demote your own account.');
-        $removingAdministrator = $user->role === 'administrator'
-            && (($data['role'] ?? 'administrator') !== 'administrator' || $disablingSelf);
-        abort_if($user->is_active && $removingAdministrator && User::where('role', 'administrator')->where('is_active', true)->count() <= 1, 409, 'At least one active administrator must remain.');
-        $user->update($data);
-        if (array_key_exists('is_active', $data) && ! $data['is_active']) {
+        $disabling = array_key_exists('is_active', $data) && ! filter_var($data['is_active'], FILTER_VALIDATE_BOOLEAN);
+        abort_if($user->is($request->user()) && ($disabling || ($data['role'] ?? $user->role) !== 'administrator'), 422, 'You cannot disable or demote your own account.');
+        $removingAdministrator = $guard->removesAdministrator($user, $data);
+
+        DB::transaction(function () use ($user, $data, $removingAdministrator, $guard): void {
+            if ($removingAdministrator && $user->is_active) {
+                $guard->assertNotLastAdministrator();
+            }
+
+            $user->update($data);
+        });
+
+        // A password reset by an administrator must also cut off existing sessions.
+        if (array_key_exists('password', $data) || (array_key_exists('is_active', $data) && ! $user->is_active)) {
             $user->tokens()->delete();
         }
         $audit->record($request, 'updated', 'user', $user->id, ['changed_fields' => array_keys($data)]);
@@ -65,13 +74,20 @@ class UserController extends Controller
         return response()->json($user->fresh()->only(['id', 'name', 'email', 'role', 'is_active', 'created_at', 'updated_at']));
     }
 
-    public function destroy(Request $request, User $user, AuditLogger $audit)
+    public function destroy(Request $request, User $user, AuditLogger $audit, AdministratorGuard $guard)
     {
         abort_if($user->is($request->user()), 422, 'You cannot delete your own account.');
-        abort_if($user->role === 'administrator' && $user->is_active && User::where('role', 'administrator')->where('is_active', true)->count() <= 1, 409, 'At least one active administrator must remain.');
+
+        DB::transaction(function () use ($user, $guard): void {
+            if ($user->role === 'administrator' && $user->is_active) {
+                $guard->assertNotLastAdministrator();
+            }
+
+            $user->tokens()->delete();
+            $user->delete();
+        });
+
         $audit->record($request, 'deleted', 'user', $user->id);
-        $user->tokens()->delete();
-        $user->delete();
 
         return response()->noContent();
     }

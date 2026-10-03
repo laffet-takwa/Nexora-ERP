@@ -72,19 +72,22 @@ class InventoryController extends Controller
             if ($data['type'] === 'transfer' && (! isset($data['from_location'], $data['to_location']) || $data['from_location'] === $data['to_location'])) {
                 throw ValidationException::withMessages(['to_location' => 'A transfer requires two different locations.']);
             }
+            // `quantity` stays an unsigned magnitude; `delta` carries the signed
+            // effect so the ledger reconciles against products.stock_quantity.
             $recordedQuantity = $data['type'] === 'adjustment' ? abs($newQuantity - $oldQuantity) : $quantity;
             $product->update(['stock_quantity' => $newQuantity]);
 
             return InventoryMovement::create([
                 ...$data,
                 'quantity' => $recordedQuantity,
+                'delta' => $newQuantity - $oldQuantity,
                 'quantity_after' => $newQuantity,
                 'user_id' => $request->user()->id,
             ]);
         });
-        $audit->record($request, 'stock_moved', 'product', $movement->product_id, ['type' => $movement->type, 'quantity' => $movement->quantity]);
+        $audit->record($request, 'stock_moved', 'product', $movement->product_id, ['type' => $movement->type, 'quantity' => $movement->quantity, 'delta' => $movement->delta]);
         $product = $movement->product;
-        if ($product->stock_quantity <= $product->minimum_stock_level) {
+        if ($product->minimum_stock_level > 0 && $product->stock_quantity <= $product->minimum_stock_level) {
             $notifier->notifyAdministrators('low_stock', 'Product '.$product->name.' is low in stock.', ['product_id' => $product->id]);
         }
 

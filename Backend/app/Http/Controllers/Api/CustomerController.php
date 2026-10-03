@@ -19,6 +19,9 @@ class CustomerController extends Controller
                 ->orWhere('company', 'like', "%{$search}%")
                 ->orWhere('email', 'like', "%{$search}%"));
         }
+        if ($city = $request->query('city')) {
+            $query->where('city', 'like', "%{$city}%");
+        }
 
         $sort = $request->query('sort', 'created_at');
         $direction = $request->query('direction', 'desc');

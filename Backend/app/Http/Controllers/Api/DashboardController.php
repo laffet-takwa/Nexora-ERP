@@ -17,7 +17,7 @@ class DashboardController extends Controller
 {
     public function __invoke(Request $request)
     {
-        $outstanding = Invoice::query()->whereNotIn('status', ['paid', 'cancelled', 'draft'])
+        $outstanding = Invoice::query()->whereNotIn('status', ['paid', 'cancelled', 'draft', 'void'])
             ->selectRaw('COALESCE(SUM(total - COALESCE((SELECT SUM(amount) FROM payments WHERE payments.invoice_id = invoices.id), 0)), 0) as balance')
             ->value('balance');
 
@@ -27,18 +27,18 @@ class DashboardController extends Controller
                 'total_products' => Product::count(),
                 'total_orders' => Order::count(),
                 'total_revenue' => (float) Payment::sum('amount'),
-                'pending_invoices' => Invoice::whereIn('status', ['pending', 'partially_paid', 'overdue'])->count(),
-                'paid_invoices' => Invoice::where('status', 'paid')->count(),
+                'pending_invoices' => Invoice::whereIn('payment_status', ['unpaid', 'partially_paid'])->whereNotIn('status', ['cancelled', 'void', 'draft'])->count(),
+                'paid_invoices' => Invoice::where('payment_status', 'paid')->count(),
+                'overdue_invoices' => Invoice::where('due_status', 'overdue')->whereNotIn('status', ['cancelled', 'void', 'draft'])->count(),
                 'outstanding_payments' => (float) $outstanding,
-                'low_stock_products' => Product::whereColumn('stock_quantity', '<=', 'minimum_stock_level')->count(),
+                'low_stock_products' => Product::whereColumn('stock_quantity', '<=', 'minimum_stock_level')
+                    ->where('minimum_stock_level', '>', 0)->count(),
             ],
             'sales_over_time' => Order::query()->where('status', 'completed')
                 ->where('created_at', '>=', now()->subDays(29)->startOfDay())
                 ->selectRaw('DATE(created_at) as date, COUNT(*) as orders, SUM(total) as total')
                 ->groupBy('date')->orderBy('date')->get(),
-            'revenue_by_month' => Payment::query()->where('payment_date', '>=', now()->subMonths(11)->startOfMonth())
-                ->selectRaw("DATE_FORMAT(payment_date, '%Y-%m') as month, SUM(amount) as total")
-                ->groupBy('month')->orderBy('month')->get(),
+            'revenue_by_month' => $this->revenueByMonth(),
             'top_products' => DB::table('order_items')
                 ->join('orders', 'orders.id', '=', 'order_items.order_id')
                 ->where('orders.status', 'completed')
@@ -47,8 +47,9 @@ class DashboardController extends Controller
             'recent_orders' => Order::with('customer:id,first_name,last_name')->latest()->limit(5)->get(),
             'recent_payments' => Payment::with(['invoice:id,invoice_number', 'customer:id,first_name,last_name'])->latest('payment_date')->limit(5)->get(),
             'recent_invoices' => Invoice::with('customer:id,first_name,last_name')->latest('invoice_date')->limit(5)->get(),
-            'low_stock' => Product::with('category:id,name')->whereColumn('stock_quantity', '<=', 'minimum_stock_level')->orderBy('stock_quantity')->limit(10)->get(),
-            'stock_movement_count' => InventoryMovement::whereDate('created_at', today())->count(),
+            'low_stock' => Product::with('category:id,name')->whereColumn('stock_quantity', '<=', 'minimum_stock_level')
+                ->where('minimum_stock_level', '>', 0)->orderBy('stock_quantity')->limit(10)->get(),
+            'stock_movement_count' => InventoryMovement::whereBetween('created_at', [today()->startOfDay(), today()->endOfDay()])->count(),
         ];
 
         if ($request->user()->isAdministrator()) {
@@ -56,5 +57,22 @@ class DashboardController extends Controller
         }
 
         return response()->json($data);
+    }
+
+    /**
+     * Twelve months of collected revenue.
+     *
+     * Months are derived with a driver-aware expression because SQLite has no
+     * DATE_FORMAT, and the test suite runs on SQLite while production runs MySQL.
+     */
+    protected function revenueByMonth()
+    {
+        $monthExpression = DB::connection()->getDriverName() === 'sqlite'
+            ? "strftime('%Y-%m', payment_date)"
+            : "DATE_FORMAT(payment_date, '%Y-%m')";
+
+        return Payment::query()->where('payment_date', '>=', now()->subMonths(11)->startOfMonth())
+            ->selectRaw("{$monthExpression} as month, SUM(amount) as total")
+            ->groupBy('month')->orderBy('month')->get();
     }
 }

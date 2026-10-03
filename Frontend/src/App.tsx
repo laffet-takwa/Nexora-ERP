@@ -1,20 +1,17 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
+import { ApiError, apiFetch, describeError } from './api'
+import { FieldError } from './FieldError'
+import { Pagination } from './Pagination'
+import { formatCurrency, formatDate, formatDateTime, formatNumber, initials, parseSettingValue, statusClass, statusLabel, stockClass, stockLabel, toNumber } from './format'
+import { useApiList, type PaginatedResponse } from './useApiList'
+import { useFormErrors } from './useFormErrors'
+import { pageFromPath, pushPage, replacePage, type PageKey } from './routes'
+
+/** Every list page takes the token and an optional post-mutation refresh. */
+type PageProps = { token: string; onChanged?: () => void | Promise<void> }
 
 type ThemeMode = 'light' | 'dark'
-type PageKey =
-  | 'dashboard'
-  | 'customers'
-  | 'products'
-  | 'orders'
-  | 'invoices'
-  | 'payments'
-  | 'inventory'
-  | 'reports'
-  | 'users'
-  | 'roles'
-  | 'audit'
-  | 'settings'
 
 type NavGroup = {
   label: string
@@ -91,13 +88,6 @@ type DashboardResponse = {
   [key: string]: unknown
 }
 
-type PaginatedResponse<T> = {
-  data: T[]
-  current_page: number
-  last_page: number
-  total: number
-}
-
 type CustomerRecord = {
   id: number
   first_name: string
@@ -134,7 +124,12 @@ type InvoiceRecord = {
   invoice_number: string
   invoice_date: string
   due_date: string
+  /** Backward-compatible collapsed value. Prefer payment_status / due_status. */
   status: string
+  /** Payment progress: unpaid | partially_paid | paid */
+  payment_status?: string
+  /** Calendar lateness: current | overdue */
+  due_status?: string
   total: number | string
   payments_sum_amount?: number | string
   customer?: { first_name: string; last_name: string } | null
@@ -176,66 +171,34 @@ type NotificationRecord = {
   data: { event?: string; message?: string }
 }
 
-async function apiFetch<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
-  const headers = new Headers(options.headers ?? {})
-  headers.set('Accept', 'application/json')
-
-  if (!(options.body instanceof FormData)) {
-    headers.set('Content-Type', 'application/json')
-  }
-
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`)
-  }
-
-  const response = await fetch(`/api${path}`, {
-    ...options,
-    headers,
-    credentials: 'include',
-  })
-
-  const text = await response.text()
-  const payload = text ? JSON.parse(text) : null
-
-  if (!response.ok) {
-    throw new Error(payload?.message ?? 'Request failed')
-  }
-
-  return payload as T
-}
-
-function useApiList<T>(path: string, token: string, search: string) {
-  const [result, setResult] = useState<PaginatedResponse<T> | null>(null)
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [revision, setRevision] = useState(0)
-
-  useEffect(() => {
-    const query = new URLSearchParams({ per_page: '100' })
-    if (search.trim()) query.set('search', search.trim())
-
-    let active = true
-    setLoading(true)
-    setError('')
-    void apiFetch<PaginatedResponse<T>>(`/v1/${path}?${query.toString()}`, { method: 'GET' }, token)
-      .then((response) => {
-        if (active) setResult(response)
-      })
-      .catch((requestError) => {
-        if (active) setError(requestError instanceof Error ? requestError.message : 'Unable to load records.')
-      })
-      .finally(() => {
-        if (active) setLoading(false)
-      })
-
-    return () => { active = false }
-  }, [path, search, token, revision])
-
-  return { result, error, loading, reload: () => setRevision((current) => current + 1) }
+/** Capability as reported by GET /v1/roles, derived from the backend routes. */
+type RoleCapability = {
+  key: string
+  label: string
+  permissions: Record<string, boolean>
+  restricted: Record<string, boolean>
 }
 
 function App() {
-  const [page, setPage] = useState<PageKey>('dashboard')
+  // Navigation state lives in the URL, so pages are deep-linkable and browser
+  // back/forward work.
+  const [page, setPage] = useState<PageKey>(() => pageFromPath(window.location.pathname))
+
+  // Keep the URL in step with the active page; replacePage adds no history entry.
+  useEffect(() => {
+    replacePage(page)
+  }, [page])
+
+  useEffect(() => {
+    const onPopState = () => setPage(pageFromPath(window.location.pathname))
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  const navigate = useCallback((next: PageKey) => {
+    pushPage(next)
+    setPage(next)
+  }, [])
   const [theme, setTheme] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('nexora-theme') as ThemeMode | null
     if (saved === 'light' || saved === 'dark') return saved
@@ -255,6 +218,9 @@ function App() {
   const [user, setUser] = useState<User | null>(null)
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('nexora-token'))
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
+  const [capabilities, setCapabilities] = useState<RoleCapability[]>([])
+  const [sessionError, setSessionError] = useState('')
+  const [dashboardError, setDashboardError] = useState('')
   const [authError, setAuthError] = useState('')
   const [isAuthLoading, setIsAuthLoading] = useState(false)
 
@@ -263,30 +229,134 @@ function App() {
     localStorage.setItem('nexora-theme', theme)
   }, [theme])
 
+  const signOut = useCallback((message = '') => {
+    localStorage.removeItem('nexora-token')
+    setToken(null)
+    setUser(null)
+    setDashboard(null)
+    setCapabilities([])
+    setSessionError(message)
+  }, [])
+
+  /**
+   * Load the session.
+   *
+   * Only a 401 means the token is no longer usable. A 403 is a disabled account or
+   * a role gate, a 5xx is a server fault and a dropped connection is a network
+   * fault: none of them justify deleting the token, which previously signed the user
+   * out whenever the backend was briefly unreachable.
+   */
   useEffect(() => {
     if (!token) {
       setUser(null)
       return
     }
 
+    let active = true
+
     const loadSession = async () => {
       setIsAuthLoading(true)
+      setSessionError('')
+
       try {
         const response = await apiFetch<{ user: User }>('/v1/user', { method: 'GET' }, token)
+        if (!active) return
         setUser(response.user)
-        const dashboardResponse = await apiFetch<DashboardResponse>('/v1/dashboard', { method: 'GET' }, token)
-        setDashboard(dashboardResponse)
+        setSessionError('')
+
+        // A failed dashboard must not invalidate an otherwise valid session.
+        try {
+          const dashboardResponse = await apiFetch<DashboardResponse>('/v1/dashboard', { method: 'GET' }, token)
+          if (active) setDashboard(dashboardResponse)
+        } catch (dashboardError) {
+          if (!active) return
+          if (dashboardError instanceof ApiError && dashboardError.isAuthFailure) {
+            signOut('Your session has expired. Please sign in again.')
+            return
+          }
+          if (active) setDashboardError(describeError(dashboardError, 'Unable to load the dashboard.'))
+        }
       } catch (error) {
-        localStorage.removeItem('nexora-token')
-        setToken(null)
-        setUser(null)
+        if (!active) return
+        if (error instanceof ApiError && error.isAuthFailure) {
+          signOut('Your session has expired. Please sign in again.')
+          return
+        }
+        setSessionError(describeError(error, 'Unable to reach the server.'))
       } finally {
-        setIsAuthLoading(false)
+        if (active) setIsAuthLoading(false)
       }
     }
 
     void loadSession()
-  }, [token])
+
+    return () => {
+      active = false
+    }
+  }, [token, signOut])
+
+  /**
+   * Dashboard refresh, called after a mutation that changes any KPI.
+   *
+   * Targeted rather than a blanket reload: only the dashboard re-fetches, and only
+   * when something that affects it actually changed.
+   */
+  const refreshDashboard = useCallback(async () => {
+    if (!token) return
+    try {
+      const response = await apiFetch<DashboardResponse>('/v1/dashboard', { method: 'GET' }, token)
+      setDashboard(response)
+      setDashboardError('')
+    } catch (error) {
+      if (error instanceof ApiError && error.isAuthFailure) signOut('Your session has expired. Please sign in again.')
+    }
+  }, [token, signOut])
+
+  // Reload the KPIs when returning to the dashboard so a payment recorded on
+  // another page is reflected without a manual refresh.
+  useEffect(() => {
+    if (token && page === 'dashboard') void refreshDashboard()
+  }, [token, page, refreshDashboard])
+
+  // Role capabilities come from the backend; they decide which navigation items
+  // are shown. The backend still enforces every one of them.
+  const isAdministrator = user?.role === 'administrator'
+
+  useEffect(() => {
+    if (!token || !isAdministrator) {
+      setCapabilities([])
+      return
+    }
+
+    let active = true
+    void apiFetch<{ data: RoleCapability[] }>('/v1/roles', {}, token)
+      .then((response) => {
+        if (active) setCapabilities(response.data)
+      })
+      .catch(() => {
+        if (active) setCapabilities([])
+      })
+
+    return () => {
+      active = false
+    }
+  }, [token, isAdministrator])
+
+  const visibleNavGroups = useMemo(
+    () =>
+      NAV_GROUPS.map((group) => ({
+        ...group,
+        items: group.items.filter((item) => {
+          // Administration is administrator only. Until the capability list has
+          // loaded, hide it rather than showing links that would 403.
+          if (item.key === 'users' || item.key === 'roles' || item.key === 'audit' || item.key === 'settings') {
+            return isAdministrator && (capabilities.length === 0 || capabilities.some((capability) => capability.key === item.key && capability.permissions.administrator))
+          }
+          return true
+        }),
+      })).filter((group) => group.items.length > 0),
+    [isAdministrator, capabilities],
+  )
 
   useEffect(() => {
     if (!token || globalSearch.trim().length < 2) {
@@ -296,34 +366,48 @@ function App() {
       return
     }
 
-    let active = true
-    const timeout = window.setTimeout(() => {
+    const controller = new AbortController()
+
+    const timer = window.setTimeout(() => {
       setSearchLoading(true)
       const query = new URLSearchParams({ search: globalSearch.trim(), per_page: '4' })
-      void Promise.all([
-        apiFetch<PaginatedResponse<CustomerRecord>>(`/v1/customers?${query}`, {}, token),
-        apiFetch<PaginatedResponse<ProductRecord>>(`/v1/products?${query}`, {}, token),
-        apiFetch<PaginatedResponse<OrderRecord>>(`/v1/orders?${query}`, {}, token),
-        apiFetch<PaginatedResponse<InvoiceRecord>>(`/v1/invoices?${query}`, {}, token),
-      ]).then(([customers, products, orders, invoices]) => {
-        if (!active) return
-        setSearchResults([
-          ...customers.data.map((customer) => ({ title: `${customer.first_name} ${customer.last_name}`.trim(), type: 'Customer', meta: customer.company || customer.email || '', page: 'customers' as const })),
-          ...products.data.map((product) => ({ title: product.name, type: 'Product', meta: `SKU ${product.sku}`, page: 'products' as const })),
-          ...orders.data.map((order) => ({ title: order.order_number, type: 'Order', meta: formatCurrency(Number(order.total)), page: 'orders' as const })),
-          ...invoices.data.map((invoice) => ({ title: invoice.invoice_number, type: 'Invoice', meta: formatCurrency(Number(invoice.total)), page: 'invoices' as const })),
-        ])
-        setSearchError('')
-      }).catch((requestError) => {
-        if (active) setSearchError(requestError instanceof Error ? requestError.message : 'Search failed.')
-      }).finally(() => {
-        if (active) setSearchLoading(false)
+      // Each endpoint settles on its own: one forbidden report must not hide the
+      // results the caller is allowed to see.
+      const sources: Array<Promise<Array<{ title: string; type: string; meta: string; page: PageKey }>>> = [
+        apiFetch<PaginatedResponse<CustomerRecord>>(`/v1/customers?${query}`, { signal: controller.signal }, token)
+          .then((response) => response.data.map((customer) => ({ title: `${customer.first_name} ${customer.last_name}`.trim(), type: 'Customer', meta: customer.company || customer.email || '', page: 'customers' as const }))),
+        apiFetch<PaginatedResponse<ProductRecord>>(`/v1/products?${query}`, { signal: controller.signal }, token)
+          .then((response) => response.data.map((product) => ({ title: product.name, type: 'Product', meta: `SKU ${product.sku}`, page: 'products' as const }))),
+        apiFetch<PaginatedResponse<OrderRecord>>(`/v1/orders?${query}`, { signal: controller.signal }, token)
+          .then((response) => response.data.map((order) => ({ title: order.order_number, type: 'Order', meta: formatCurrency(toNumber(order.total)), page: 'orders' as const }))),
+        apiFetch<PaginatedResponse<InvoiceRecord>>(`/v1/invoices?${query}`, { signal: controller.signal }, token)
+          .then((response) => response.data.map((invoice) => ({ title: invoice.invoice_number, type: 'Invoice', meta: formatCurrency(toNumber(invoice.total)), page: 'invoices' as const }))),
+      ]
+
+      void Promise.allSettled(sources).then((outcomes) => {
+        if (controller.signal.aborted) return
+
+        const results: SearchResult[] = []
+        let failure: string | null = null
+
+        for (const outcome of outcomes) {
+          if (outcome.status === 'fulfilled') {
+            results.push(...outcome.value)
+          } else {
+            const reason = outcome.reason
+            failure ??= reason instanceof ApiError ? reason.message : 'Search failed.'
+          }
+        }
+
+        setSearchResults(results)
+        setSearchError(failure ?? '')
+        setSearchLoading(false)
       })
     }, 250)
 
     return () => {
-      active = false
-      window.clearTimeout(timeout)
+      window.clearTimeout(timer)
+      controller.abort()
     }
   }, [globalSearch, token])
 
@@ -348,18 +432,15 @@ function App() {
   }, [token])
 
   const currentSection = useMemo(
-    () => NAV_GROUPS.flatMap((group) => group.items).find((item) => item.key === page)?.label ?? 'Dashboard',
-    [page],
+    () => visibleNavGroups.flatMap((group) => group.items).find((item) => item.key === page)?.label ?? 'Dashboard',
+    [page, visibleNavGroups],
   )
 
   const handleLogout = async () => {
     if (token) {
       await apiFetch('/v1/logout', { method: 'POST' }, token).catch(() => null)
     }
-    localStorage.removeItem('nexora-token')
-    setToken(null)
-    setUser(null)
-    setDashboard(null)
+    signOut()
   }
 
   const handleMarkAllNotificationsRead = async () => {
@@ -368,8 +449,8 @@ function App() {
       await apiFetch('/v1/notifications/read-all', { method: 'PATCH' }, token)
       setNotifications((current) => current.map((notification) => ({ ...notification, read_at: notification.read_at ?? new Date().toISOString() })))
       setUnreadNotifications(0)
-    } catch {
-      setNotificationError('Unable to update notifications.')
+    } catch (error) {
+      setNotificationError(describeError(error, 'Unable to update notifications.'))
     }
   }
 
@@ -403,9 +484,8 @@ function App() {
       localStorage.setItem('nexora-token', response.token)
       setToken(response.token)
       setUser(response.user)
-
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : 'Unable to sign in.')
+      setAuthError(describeError(error, 'Unable to sign in.'))
     } finally {
       setIsAuthLoading(false)
     }
@@ -428,6 +508,8 @@ function App() {
           <h1>Sign in</h1>
           <p className="page-subtitle">Connect to the ERP dashboard and continue with your operations.</p>
 
+          {sessionError ? <div className="auth-error" role="alert">{sessionError}</div> : null}
+
           <form className="login-form" onSubmit={handleLogin}>
             <label>
               Email
@@ -438,7 +520,7 @@ function App() {
               <input name="password" type="password" autoComplete="current-password" required />
             </label>
 
-            {authError ? <div className="auth-error">{authError}</div> : null}
+            {authError ? <div className="auth-error" role="alert">{authError}</div> : null}
 
             <button type="submit" className="primary-button" disabled={isAuthLoading}>
               {isAuthLoading ? 'Signing in...' : 'Login'}
@@ -453,23 +535,23 @@ function App() {
   const renderContent = () => {
     switch (page) {
       case 'customers':
-        return <CustomersPage token={token!} />
+        return <CustomersPage token={token!} onChanged={refreshDashboard} />
       case 'products':
-        return <ProductsPage token={token!} />
+        return <ProductsPage token={token!} onChanged={refreshDashboard} />
       case 'orders':
-        return <OrdersPage token={token!} />
+        return <OrdersPage token={token!} onChanged={refreshDashboard} />
       case 'invoices':
-        return <InvoicesPage token={token!} />
+        return <InvoicesPage token={token!} onChanged={refreshDashboard} />
       case 'payments':
-        return <PaymentsPage token={token!} />
+        return <PaymentsPage token={token!} onChanged={refreshDashboard} />
       case 'inventory':
-        return <InventoryPage token={token!} />
+        return <InventoryPage token={token!} onChanged={refreshDashboard} />
       case 'reports':
         return <ReportsPage token={token!} />
       case 'users':
         return <UsersPage token={token!} />
       case 'roles':
-        return <RolesPage />
+        return <RolesPage token={token!} />
       case 'audit':
         return <AuditPage token={token!} />
       case 'settings':
@@ -493,7 +575,7 @@ function App() {
         </div>
 
         <nav className="sidebar-nav" aria-label="Main navigation">
-          {NAV_GROUPS.map((group) => (
+          {visibleNavGroups.map((group) => (
             <div className="nav-group" key={group.label}>
               <div className="nav-label">{group.label}</div>
               {group.items.map((item) => (
@@ -502,7 +584,7 @@ function App() {
                   key={item.key}
                   className={`nav-item ${page === item.key ? 'active' : ''}`}
                   onClick={() => {
-                    setPage(item.key)
+                    navigate(item.key)
                     setSidebarOpen(false)
                   }}
                 >
@@ -562,7 +644,7 @@ function App() {
                   {searchError ? <div className="search-result" role="alert">{searchError}</div> : null}
                   {searchResults.map((result) => (
                     <button key={`${result.type}-${result.title}`} type="button" className="search-result" onMouseDown={(event) => event.preventDefault()} onClick={() => {
-                      setPage(result.page)
+                      navigate(result.page)
                       setGlobalSearch('')
                       setSearchOpen(false)
                     }}>
@@ -612,7 +694,17 @@ function App() {
           </div>
         </header>
 
-        <div className="page-shell">{renderContent()}</div>
+        <div className="page-shell">
+          {dashboardError ? (
+            <div className="auth-error" role="alert">
+              {dashboardError}{' '}
+              <button type="button" className="table-action" onClick={() => void refreshDashboard()}>
+                Retry
+              </button>
+            </div>
+          ) : null}
+          {renderContent()}
+        </div>
       </main>
     </div>
   )
@@ -628,25 +720,25 @@ function DashboardPage({
   const kpis = [
     {
       label: 'Revenue',
-      value: formatCurrency(Number(dashboard?.kpis?.total_revenue ?? 0)),
+      value: formatCurrency(toNumber(dashboard?.kpis?.total_revenue)),
       change: 'Live',
       detail: 'recorded payments',
     },
     {
       label: 'Orders',
-      value: formatNumber(Number(dashboard?.kpis?.total_orders ?? 0)),
+      value: formatNumber(toNumber(dashboard?.kpis?.total_orders)),
       change: 'Live',
       detail: 'all orders',
     },
     {
       label: 'Customers',
-      value: formatNumber(Number(dashboard?.kpis?.total_customers ?? 0)),
+      value: formatNumber(toNumber(dashboard?.kpis?.total_customers)),
       change: 'Live',
       detail: 'registered customers',
     },
     {
       label: 'Outstanding',
-      value: formatCurrency(Number(dashboard?.kpis?.outstanding_payments ?? 0)),
+      value: formatCurrency(toNumber(dashboard?.kpis?.outstanding_payments)),
       change: 'Live',
       detail: 'open invoice balance',
     },
@@ -655,9 +747,9 @@ function DashboardPage({
   const recentOrders = (dashboard?.recent_orders ?? []).slice(0, 4).map((order) => ({
     id: order.order_number ?? `ORD-${order.id}`,
     customer: `${order.customer?.first_name ?? ''} ${order.customer?.last_name ?? ''}`.trim() || 'Customer',
-    amount: formatCurrency(Number(order.total ?? 0)),
-    status: order.status ?? 'Pending',
-    date: order.created_at ? new Date(order.created_at).toLocaleDateString() : 'Recent',
+    amount: formatCurrency(toNumber(order.total)),
+    status: order.status ?? 'pending',
+    date: formatDate(order.created_at),
   }))
 
   const topProducts = (dashboard?.top_products ?? []).slice(0, 4).map((product) => ({
@@ -665,8 +757,8 @@ function DashboardPage({
     sales: `${product.quantity} units`,
   }))
   const dailySales = dashboard?.sales_over_time ?? []
-  const revenueSeries = dailySales.map((point) => Number(point.total ?? 0))
-  const orderSeries = dailySales.map((point) => Number(point.orders ?? 0))
+  const revenueSeries = dailySales.map((point) => toNumber(point.total))
+  const orderSeries = dailySales.map((point) => toNumber(point.orders))
   const recentRevenue = revenueSeries.reduce((total, value) => total + value, 0)
   const recentOrderCount = orderSeries.reduce((total, value) => total + value, 0)
 
@@ -759,7 +851,7 @@ function DashboardPage({
                   <strong>{order.amount}</strong>
                   <small>{order.date}</small>
                 </div>
-                <span className={`status-badge ${statusClass(order.status)}`}>{order.status}</span>
+                <span className={`status-badge ${statusClass(order.status)}`}>{statusLabel(order.status)}</span>
               </div>
             ))}
             {recentOrders.length === 0 ? <p>No recent orders.</p> : null}
@@ -770,19 +862,22 @@ function DashboardPage({
   )
 }
 
-function CustomersPage({ token }: { token: string }) {
+function CustomersPage({ token, onChanged }: PageProps) {
   const [search, setSearch] = useState('')
-  const { result, error, loading, reload } = useApiList<CustomerRecord>('customers', token, search)
+  const [city, setCity] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<CustomerRecord>('customers', token, search, { params: { city: city || undefined } })
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const createCustomer = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = event.currentTarget
     const values = new FormData(form)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/customers', {
         method: 'POST',
@@ -797,10 +892,62 @@ function CustomersPage({ token }: { token: string }) {
       setFormOpen(false)
       form.reset()
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to create customer.')
+      capture(requestError, 'Unable to create customer.')
     } finally {
       setSaving(false)
+    }
+  }
+
+  /**
+   * Export the current filter as CSV.
+   *
+   * Walks the same paginated endpoint the table uses so the file matches what is
+   * on screen instead of a truncated first page.
+   */
+  const exportCustomers = async () => {
+    setExporting(true)
+    setExportError('')
+    try {
+      const rows: string[][] = [['ID', 'First name', 'Last name', 'Company', 'Email', 'Phone']]
+      let currentPage = 1
+      let lastPage = 1
+
+      do {
+        const query = new URLSearchParams({ per_page: '100', page: String(currentPage) })
+        if (search.trim()) query.set('search', search.trim())
+        if (city) query.set('city', city)
+
+        const response = await apiFetch<PaginatedResponse<CustomerRecord>>(`/v1/customers?${query}`, {}, token)
+        for (const customer of response.data) {
+          rows.push([
+            String(customer.id),
+            customer.first_name,
+            customer.last_name,
+            customer.company ?? '',
+            customer.email ?? '',
+            customer.phone ?? '',
+          ])
+        }
+        lastPage = Math.max(response.last_page, 1)
+        currentPage += 1
+      } while (currentPage <= lastPage)
+
+      const csv = rows
+        .map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(','))
+        .join('\r\n')
+
+      const url = URL.createObjectURL(new Blob([`﻿${csv}`], { type: 'text/csv;charset=utf-8;' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `customers-${new Date().toISOString().slice(0, 10)}.csv`
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (requestError) {
+      setExportError(describeError(requestError, 'Unable to export customers.'))
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -816,12 +963,15 @@ function CustomersPage({ token }: { token: string }) {
       </div>
 
       {formOpen ? <form className="resource-form panel" onSubmit={createCustomer}>
-        <label>First name<input name="first_name" required maxLength={100} /></label>
-        <label>Last name<input name="last_name" required maxLength={100} /></label>
+        <label>First name<input name="first_name" required maxLength={100} aria-describedby={fieldError('first_name') ? 'first_name-error' : undefined} /></label>
+        <FieldError id="first_name-error" message={fieldError('first_name')} />
+        <label>Last name<input name="last_name" required maxLength={100} aria-describedby={fieldError('last_name') ? 'last_name-error' : undefined} /></label>
+        <FieldError id="last_name-error" message={fieldError('last_name')} />
         <label>Company<input name="company" maxLength={255} /></label>
-        <label>Email<input name="email" type="email" /></label>
+        <label>Email<input name="email" type="email" aria-describedby={fieldError('email') ? 'email-error' : undefined} /></label>
+        <FieldError id="email-error" message={fieldError('email')} />
         <label>Phone<input name="phone" type="tel" maxLength={40} /></label>
-        {mutationError ? <p role="alert">{mutationError}</p> : null}
+        {formError ? <p role="alert">{formError}</p> : null}
         <button className="primary-button" type="submit" disabled={saving}>{saving ? 'Saving...' : 'Create customer'}</button>
       </form> : null}
 
@@ -831,14 +981,21 @@ function CustomersPage({ token }: { token: string }) {
           <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search customers" aria-label="Search customers" />
         </div>
         <div className="toolbar-actions">
-          <button className="secondary-button" type="button">
-            Filters
-          </button>
-          <button className="secondary-button" type="button">
-            Export
+          <input
+            className="toolbar-filter"
+            type="text"
+            value={city}
+            onChange={(event) => setCity(event.target.value)}
+            placeholder="Filter by city"
+            aria-label="Filter by city"
+          />
+          {city ? <button type="button" className="table-action" onClick={() => setCity('')}>Clear filter</button> : null}
+          <button type="button" className="secondary-button" onClick={() => void exportCustomers()} disabled={exporting}>
+            {exporting ? 'Exporting...' : 'Export CSV'}
           </button>
         </div>
       </div>
+      {exportError ? <p className="auth-error" role="alert">{exportError}</p> : null}
 
       <div className="panel table-panel">
         <table>
@@ -854,14 +1011,14 @@ function CustomersPage({ token }: { token: string }) {
           </thead>
           <tbody>
             {loading ? <tr><td colSpan={6}>Loading customers...</td></tr> : null}
-            {error ? <tr><td colSpan={6} role="alert">{error}</td></tr> : null}
+            {error ? <tr><td colSpan={6}><span role="alert">{errorMessage}</span></td></tr> : null}
             {!loading && !error && result?.data.map((customer) => {
               const name = `${customer.first_name} ${customer.last_name}`.trim()
               return (
               <tr key={customer.id}>
                 <td>
                   <div className="user-cell">
-                    <div className="avatar avatar-xs">{name.slice(0, 2).toUpperCase()}</div>
+                    <div className="avatar avatar-xs">{initials(name)}</div>
                     <div>
                       <strong>{name}</strong>
                     </div>
@@ -878,23 +1035,31 @@ function CustomersPage({ token }: { token: string }) {
           </tbody>
         </table>
       </div>
+
+      <Pagination
+        currentPage={result?.current_page ?? page}
+        lastPage={result?.last_page ?? 1}
+        total={result?.total ?? 0}
+        loading={loading}
+        onPageChange={setPage}
+      />
     </>
   )
 }
 
-function ProductsPage({ token }: { token: string }) {
+function ProductsPage({ token, onChanged }: PageProps) {
   const [search, setSearch] = useState('')
-  const { result, error, loading, reload } = useApiList<ProductRecord>('products', token, search)
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<ProductRecord>('products', token, search)
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const createProduct = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = event.currentTarget
     const values = new FormData(form)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/products', {
         method: 'POST',
@@ -909,8 +1074,9 @@ function ProductsPage({ token }: { token: string }) {
       form.reset()
       setFormOpen(false)
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to create product.')
+      capture(requestError, 'Unable to create product.')
     } finally {
       setSaving(false)
     }
@@ -919,50 +1085,62 @@ function ProductsPage({ token }: { token: string }) {
   return <>
     <div className="page-header-row page-header-stack"><div><p className="eyebrow">Catalog</p><h1>Products</h1><p className="page-subtitle">Track inventory, pricing and product performance.</p></div><button type="button" className="primary-button" onClick={() => setFormOpen((open) => !open)}>{formOpen ? 'Cancel' : '+ Add Product'}</button></div>
     {formOpen ? <form className="resource-form panel" onSubmit={createProduct}>
-      <label>Product name<input name="name" required maxLength={255} /></label>
-      <label>SKU<input name="sku" required maxLength={100} /></label>
-      <label>Price<input name="selling_price" type="number" min="0.001" step="0.001" required /></label>
+      <label>Product name<input name="name" required maxLength={255} aria-describedby={fieldError('name') ? 'product-name-error' : undefined} /></label>
+      <FieldError id="product-name-error" message={fieldError('name')} />
+      <label>SKU<input name="sku" required maxLength={100} aria-describedby={fieldError('sku') ? 'sku-error' : undefined} /></label>
+      <FieldError id="sku-error" message={fieldError('sku')} />
+      <label>Price<input name="selling_price" type="number" min="0.001" step="0.001" required aria-describedby={fieldError('selling_price') ? 'price-error' : undefined} /></label>
+      <FieldError id="price-error" message={fieldError('selling_price')} />
       <label>Opening stock<input name="stock_quantity" type="number" min="0" step="1" defaultValue="0" /></label>
       <label>Low-stock threshold<input name="minimum_stock_level" type="number" min="0" step="1" defaultValue="0" /></label>
-      {mutationError ? <p role="alert">{mutationError}</p> : null}
+      {formError ? <p role="alert">{formError}</p> : null}
       <button type="submit" className="primary-button" disabled={saving}>{saving ? 'Saving...' : 'Create product'}</button>
     </form> : null}
     <div className="toolbar panel"><div className="toolbar-group"><SearchIcon /><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search products" aria-label="Search products" /></div></div>
     <div className="products-grid">
       {loading ? <div className="panel">Loading products...</div> : null}
-      {error ? <div className="panel" role="alert">{error}</div> : null}
+      {error ? <div className="panel" role="alert">{errorMessage}</div> : null}
       {!loading && !error && result?.data.map((product) => {
-        const stockStatus = product.stock_quantity === 0 ? 'Out of Stock' : product.stock_quantity <= product.minimum_stock_level ? 'Low Stock' : 'In Stock'
+        const stockStatus = stockLabel(product.stock_quantity, product.minimum_stock_level)
         return <div key={product.id} className="panel product-card">
-          <div className="product-card-top"><div className="product-image">{product.name.slice(0, 2).toUpperCase()}</div><span className={`status-badge ${stockClass(stockStatus)}`}>{stockStatus}</span></div>
+          <div className="product-card-top"><div className="product-image">{initials(product.name)}</div><span className={`status-badge ${stockClass(product.stock_quantity, product.minimum_stock_level)}`}>{stockStatus}</span></div>
           <div className="product-info"><strong>{product.name}</strong><small>{product.sku}</small></div>
-          <div className="product-meta"><span>{product.category?.name ?? 'Uncategorized'}</span><span>{formatCurrency(Number(product.selling_price))}</span></div>
+          <div className="product-meta"><span>{product.category?.name ?? 'Uncategorized'}</span><span>{formatCurrency(toNumber(product.selling_price))}</span></div>
           <div className="product-footer"><div><small>Stock</small><strong>{product.stock_quantity}</strong></div></div>
         </div>
       })}
       {!loading && !error && result?.data.length === 0 ? <div className="panel">No products found.</div> : null}
     </div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
   </>
 }
 
-function OrdersPage({ token }: { token: string }) {
+function OrdersPage({ token, onChanged }: PageProps) {
   const [search, setSearch] = useState('')
-  const { result, error, loading, reload } = useApiList<OrderRecord>('orders', token, search)
-  const customers = useApiList<CustomerRecord>('customers', token, '')
-  const products = useApiList<ProductRecord>('products', token, '')
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<OrderRecord>('orders', token, search)
+  const customers = useApiList<CustomerRecord>('customers', token, '', { perPage: 100 })
+  const products = useApiList<ProductRecord>('products', token, '', { perPage: 100 })
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const advanceOrder = async (order: OrderRecord) => {
     const nextStatus = { pending: 'confirmed', confirmed: 'processing', processing: 'completed' }[order.status]
     if (!nextStatus) return
-    setMutationError('')
+    reset()
     try {
       await apiFetch(`/v1/orders/${order.id}/status`, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }, token)
       reload()
+      // Completing an order moves stock and changes the dashboard KPIs.
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to update order status.')
+      capture(requestError, 'Unable to update order status.')
     }
   }
 
@@ -970,7 +1148,7 @@ function OrdersPage({ token }: { token: string }) {
     event.preventDefault()
     const values = new FormData(event.currentTarget)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/orders', {
         method: 'POST',
@@ -981,8 +1159,9 @@ function OrdersPage({ token }: { token: string }) {
       }, token)
       setFormOpen(false)
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to create order.')
+      capture(requestError, 'Unable to create order.')
     } finally {
       setSaving(false)
     }
@@ -994,47 +1173,56 @@ function OrdersPage({ token }: { token: string }) {
       <label>Customer<select name="customer_id" required defaultValue=""><option value="" disabled>Select customer</option>{customers.result?.data.map((customer) => <option value={customer.id} key={customer.id}>{customer.first_name} {customer.last_name}</option>)}</select></label>
       <label>Product<select name="product_id" required defaultValue=""><option value="" disabled>Select product</option>{products.result?.data.filter((product) => product.status === 'active' && product.stock_quantity > 0).map((product) => <option value={product.id} key={product.id}>{product.name} ({product.stock_quantity} available)</option>)}</select></label>
       <label>Quantity<input name="quantity" type="number" min="1" step="1" defaultValue="1" required /></label>
-      {customers.error || products.error ? <p role="alert">{customers.error || products.error}</p> : null}
-      {mutationError ? <p role="alert">{mutationError}</p> : null}
+      {customers.error || products.error ? <p role="alert">{customers.errorMessage || products.errorMessage}</p> : null}
+      {formError ? <p role="alert">{formError}</p> : null}
+      {fieldError('items') ? <FieldError message={fieldError('items')} /> : null}
       <button type="submit" className="primary-button" disabled={saving || customers.loading || products.loading || !customers.result?.data.length || !products.result?.data.length}>{saving ? 'Creating...' : 'Create order'}</button>
     </form> : null}
     <div className="toolbar panel"><div className="toolbar-group"><SearchIcon /><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search orders or customers" aria-label="Search orders" /></div></div>
-    {mutationError ? <p className="auth-error" role="alert">{mutationError}</p> : null}
+    {formError ? <p className="auth-error" role="alert">{formError}</p> : null}
     <div className="panel table-panel"><table>
       <thead><tr><th>Order ID</th><th>Customer</th><th>Total</th><th>Status</th><th>Date</th><th>Action</th></tr></thead>
       <tbody>
         {loading ? <tr><td colSpan={6}>Loading orders...</td></tr> : null}
-        {error ? <tr><td colSpan={6} role="alert">{error}</td></tr> : null}
+        {error ? <tr><td colSpan={6}><span role="alert">{errorMessage}</span></td></tr> : null}
         {!loading && !error && result?.data.map((order) => <tr key={order.id}>
           <td>{order.order_number}</td><td>{`${order.customer?.first_name ?? ''} ${order.customer?.last_name ?? ''}`.trim() || '—'}</td>
-          <td>{formatCurrency(Number(order.total))}</td><td><span className={`status-badge ${statusClass(order.status)}`}>{order.status}</span></td><td>{new Date(order.created_at).toLocaleDateString()}</td>
+          <td>{formatCurrency(toNumber(order.total))}</td><td><span className={`status-badge ${statusClass(order.status)}`}>{statusLabel(order.status)}</span></td><td>{formatDate(order.created_at)}</td>
           <td>{['pending', 'confirmed', 'processing'].includes(order.status) ? <button type="button" className="table-action" onClick={() => void advanceOrder(order)}>{order.status === 'processing' ? 'Complete' : 'Advance'}</button> : '—'}</td>
         </tr>)}
         {!loading && !error && result?.data.length === 0 ? <tr><td colSpan={6}>No orders found.</td></tr> : null}
       </tbody>
     </table></div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
   </>
 }
 
-function InvoicesPage({ token }: { token: string }) {
+function InvoicesPage({ token, onChanged }: PageProps) {
   const [search, setSearch] = useState('')
-  const { result, error, loading, reload } = useApiList<InvoiceRecord>('invoices', token, search)
-  const orders = useApiList<OrderRecord>('orders', token, '')
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<InvoiceRecord>('invoices', token, search)
+  const orders = useApiList<OrderRecord>('orders', token, '', { perPage: 100 })
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const createInvoice = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const values = new FormData(event.currentTarget)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/invoices', { method: 'POST', body: JSON.stringify({ order_id: Number(values.get('order_id')) }) }, token)
       setFormOpen(false)
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to create invoice.')
+      capture(requestError, 'Unable to create invoice.')
     } finally {
       setSaving(false)
     }
@@ -1043,37 +1231,52 @@ function InvoicesPage({ token }: { token: string }) {
   return <>
     <div className="page-header-row page-header-stack"><div><p className="eyebrow">Sales</p><h1>Invoices</h1><p className="page-subtitle">Invoice balances and payment status.</p></div><button type="button" className="primary-button" onClick={() => setFormOpen((open) => !open)}>{formOpen ? 'Cancel' : '+ Create Invoice'}</button></div>
     {formOpen ? <form className="resource-form panel" onSubmit={createInvoice}>
-      <label>Eligible order<select name="order_id" required defaultValue=""><option value="" disabled>Select confirmed order</option>{orders.result?.data.filter((order) => ['confirmed', 'processing', 'completed'].includes(order.status)).map((order) => <option value={order.id} key={order.id}>{order.order_number} · {formatCurrency(Number(order.total))}</option>)}</select></label>
-      {orders.error ? <p role="alert">{orders.error}</p> : null}{mutationError ? <p role="alert">{mutationError}</p> : null}
+      <label>Eligible order<select name="order_id" required defaultValue=""><option value="" disabled>Select confirmed order</option>{orders.result?.data.filter((order) => ['confirmed', 'processing', 'completed'].includes(order.status)).map((order) => <option value={order.id} key={order.id}>{order.order_number} · {formatCurrency(toNumber(order.total))}</option>)}</select></label>
+      {orders.error ? <p role="alert">{orders.errorMessage}</p> : null}{formError ? <p role="alert">{formError}</p> : null}
+      {fieldError('order_id') ? <FieldError message={fieldError('order_id')} /> : null}
       <button type="submit" className="primary-button" disabled={saving || orders.loading}>{saving ? 'Creating...' : 'Create invoice'}</button>
     </form> : null}
     <div className="toolbar panel"><div className="toolbar-group"><SearchIcon /><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search invoices or customers" aria-label="Search invoices" /></div></div>
-    <div className="panel table-panel"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Invoice date</th><th>Due date</th><th>Total</th><th>Paid</th><th>Status</th></tr></thead><tbody>
-      {loading ? <tr><td colSpan={7}>Loading invoices...</td></tr> : null}
-      {error ? <tr><td colSpan={7} role="alert">{error}</td></tr> : null}
-      {!loading && !error && result?.data.map((invoice) => <tr key={invoice.id}>
-        <td>{invoice.invoice_number}</td><td>{`${invoice.customer?.first_name ?? ''} ${invoice.customer?.last_name ?? ''}`.trim() || '—'}</td>
-        <td>{invoice.invoice_date}</td><td>{invoice.due_date}</td><td>{formatCurrency(Number(invoice.total))}</td><td>{formatCurrency(Number(invoice.payments_sum_amount ?? 0))}</td>
-        <td><span className={`status-badge ${statusClass(invoice.status)}`}>{invoice.status.replaceAll('_', ' ')}</span></td>
-      </tr>)}
-      {!loading && !error && result?.data.length === 0 ? <tr><td colSpan={7}>No invoices found.</td></tr> : null}
+    <div className="panel table-panel"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Invoice date</th><th>Due date</th><th>Total</th><th>Paid</th><th>Payment</th><th>Due</th></tr></thead><tbody>
+      {loading ? <tr><td colSpan={8}>Loading invoices...</td></tr> : null}
+      {error ? <tr><td colSpan={8}><span role="alert">{errorMessage}</span></td></tr> : null}
+      {!loading && !error && result?.data.map((invoice) => {
+        // Payment progress and lateness are separate facts; showing only the
+        // collapsed status hid that an invoice was 90% paid AND past due.
+        const paymentStatus = invoice.payment_status ?? invoice.status
+        const dueStatus = invoice.due_status ?? ''
+        return <tr key={invoice.id}>
+          <td>{invoice.invoice_number}</td><td>{`${invoice.customer?.first_name ?? ''} ${invoice.customer?.last_name ?? ''}`.trim() || '—'}</td>
+          <td>{formatDate(invoice.invoice_date)}</td><td>{formatDate(invoice.due_date)}</td><td>{formatCurrency(toNumber(invoice.total))}</td><td>{formatCurrency(toNumber(invoice.payments_sum_amount ?? 0))}</td>
+          <td><span className={`status-badge ${statusClass(paymentStatus)}`}>{statusLabel(paymentStatus)}</span></td>
+          <td>{dueStatus ? <span className={`status-badge ${dueStatus === 'overdue' ? 'danger' : 'neutral'}`}>{statusLabel(dueStatus)}</span> : '—'}</td>
+        </tr>
+      })}
+      {!loading && !error && result?.data.length === 0 ? <tr><td colSpan={8}>No invoices found.</td></tr> : null}
     </tbody></table></div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
   </>
 }
 
-function PaymentsPage({ token }: { token: string }) {
+function PaymentsPage({ token, onChanged }: PageProps) {
   const [search, setSearch] = useState('')
-  const { result, error, loading, reload } = useApiList<PaymentRecord>('payments', token, search)
-  const invoices = useApiList<InvoiceRecord>('invoices', token, '')
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<PaymentRecord>('payments', token, search)
+  const invoices = useApiList<InvoiceRecord>('invoices', token, '', { perPage: 100 })
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const recordPayment = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const values = new FormData(event.currentTarget)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/payments', {
         method: 'POST',
@@ -1081,8 +1284,9 @@ function PaymentsPage({ token }: { token: string }) {
       }, token)
       setFormOpen(false)
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to record payment.')
+      capture(requestError, 'Unable to record payment.')
     } finally {
       setSaving(false)
     }
@@ -1091,35 +1295,44 @@ function PaymentsPage({ token }: { token: string }) {
   return <>
     <div className="page-header-row page-header-stack"><div><p className="eyebrow">Sales</p><h1>Payments</h1><p className="page-subtitle">Recorded customer payments.</p></div><button type="button" className="primary-button" onClick={() => setFormOpen((open) => !open)}>{formOpen ? 'Cancel' : '+ Record Payment'}</button></div>
     {formOpen ? <form className="resource-form panel" onSubmit={recordPayment}>
-      <label>Invoice<select name="invoice_id" required defaultValue=""><option value="" disabled>Select open invoice</option>{invoices.result?.data.filter((invoice) => !['draft', 'cancelled', 'paid'].includes(invoice.status)).map((invoice) => <option value={invoice.id} key={invoice.id}>{invoice.invoice_number} · {formatCurrency(Number(invoice.total))}</option>)}</select></label>
-      <label>Amount<input name="amount" type="number" min="0.001" step="0.001" required /></label>
+      <label>Invoice<select name="invoice_id" required defaultValue="" aria-describedby={fieldError('invoice_id') ? 'invoice-error' : undefined}><option value="" disabled>Select open invoice</option>{invoices.result?.data.filter((invoice) => !['draft', 'cancelled', 'void'].includes(invoice.status) && invoice.payment_status !== 'paid').map((invoice) => <option value={invoice.id} key={invoice.id}>{invoice.invoice_number} · {formatCurrency(toNumber(invoice.total))}</option>)}</select></label>
+      <FieldError id="invoice-error" message={fieldError('invoice_id')} />
+      <label>Amount<input name="amount" type="number" min="0.001" step="0.001" required aria-describedby={fieldError('amount') ? 'amount-error' : undefined} /></label>
+      <FieldError id="amount-error" message={fieldError('amount')} />
       <label>Method<select name="method" defaultValue="bank_transfer"><option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="card">Card</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label>
-      {invoices.error ? <p role="alert">{invoices.error}</p> : null}{mutationError ? <p role="alert">{mutationError}</p> : null}
+      {invoices.error ? <p role="alert">{invoices.errorMessage}</p> : null}{formError ? <p role="alert">{formError}</p> : null}
       <button type="submit" className="primary-button" disabled={saving || invoices.loading}>{saving ? 'Saving...' : 'Save payment'}</button>
     </form> : null}
     <div className="toolbar panel"><div className="toolbar-group"><SearchIcon /><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search invoice number" aria-label="Search payments" /></div></div>
     <div className="panel table-panel"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Payment date</th><th>Method</th><th>Amount</th></tr></thead><tbody>
       {loading ? <tr><td colSpan={5}>Loading payments...</td></tr> : null}
-      {error ? <tr><td colSpan={5} role="alert">{error}</td></tr> : null}
+      {error ? <tr><td colSpan={5}><span role="alert">{errorMessage}</span></td></tr> : null}
       {!loading && !error && result?.data.map((payment) => <tr key={payment.id}>
         <td>{payment.invoice?.invoice_number ?? '—'}</td><td>{`${payment.customer?.first_name ?? ''} ${payment.customer?.last_name ?? ''}`.trim() || '—'}</td>
-        <td>{new Date(payment.payment_date).toLocaleDateString()}</td><td>{payment.method.replaceAll('_', ' ')}</td><td>{formatCurrency(Number(payment.amount))}</td>
+        <td>{formatDate(payment.payment_date)}</td><td>{statusLabel(payment.method)}</td><td>{formatCurrency(toNumber(payment.amount))}</td>
       </tr>)}
       {!loading && !error && result?.data.length === 0 ? <tr><td colSpan={5}>No payments found.</td></tr> : null}
     </tbody></table></div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
   </>
 }
 
-function InventoryPage({ token }: { token: string }) {
-  const { result, error, loading, reload } = useApiList<ProductRecord>('inventory', token, '')
+function InventoryPage({ token, onChanged }: PageProps) {
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<ProductRecord>('inventory', token, '')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
   const products = result?.data ?? []
   const lowStock = products.filter((product) => product.stock_quantity <= product.minimum_stock_level)
   const metrics = [
     { label: 'Total products', value: formatNumber(result?.total ?? 0) },
-    { label: 'Inventory value', value: formatCurrency(products.reduce((total, product) => total + product.stock_quantity * Number(product.selling_price), 0)) },
+    { label: 'Inventory value', value: formatCurrency(products.reduce((total, product) => total + product.stock_quantity * toNumber(product.selling_price), 0)) },
     { label: 'Low stock', value: formatNumber(lowStock.length) },
     { label: 'Out of stock', value: formatNumber(products.filter((product) => product.stock_quantity === 0).length) },
   ]
@@ -1128,7 +1341,7 @@ function InventoryPage({ token }: { token: string }) {
     event.preventDefault()
     const values = new FormData(event.currentTarget)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/inventory/movements', {
         method: 'POST',
@@ -1141,8 +1354,9 @@ function InventoryPage({ token }: { token: string }) {
       }, token)
       setFormOpen(false)
       reload()
+      await onChanged?.()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to update stock.')
+      capture(requestError, 'Unable to update stock.')
     } finally {
       setSaving(false)
     }
@@ -1153,71 +1367,110 @@ function InventoryPage({ token }: { token: string }) {
     {formOpen ? <form className="resource-form panel" onSubmit={recordMovement}>
       <label>Product<select name="product_id" required defaultValue=""><option value="" disabled>Select product</option>{products.map((product) => <option value={product.id} key={product.id}>{product.name} · {product.stock_quantity} available</option>)}</select></label>
       <label>Movement<select name="type" defaultValue="in"><option value="in">Stock in</option><option value="out">Stock out</option><option value="adjustment">Set stock level</option></select></label>
-      <label>Quantity<input name="quantity" type="number" min="0" step="1" required /></label>
+      <label>Quantity<input name="quantity" type="number" min="0" step="1" required aria-describedby={fieldError('quantity') ? 'quantity-error' : undefined} /></label>
+      <FieldError id="quantity-error" message={fieldError('quantity')} />
       <label>Reason<input name="reason" maxLength={255} /></label>
-      {error ? <p role="alert">{error}</p> : null}{mutationError ? <p role="alert">{mutationError}</p> : null}
+      {formError ? <p role="alert">{formError}</p> : null}
       <button type="submit" className="primary-button" disabled={saving || loading || products.length === 0}>{saving ? 'Saving...' : 'Save movement'}</button>
     </form> : null}
     <section className="kpi-grid inventory-grid">{metrics.map((metric) => <div className="kpi-card" key={metric.label}><div className="kpi-label">{metric.label}</div><div className="kpi-value">{metric.value}</div></div>)}</section>
     <div className="panel table-panel"><h3>Low stock</h3><table><thead><tr><th>Product</th><th>SKU</th><th>Available</th><th>Minimum</th><th>Status</th></tr></thead><tbody>
       {loading ? <tr><td colSpan={5}>Loading inventory...</td></tr> : null}
-      {error ? <tr><td colSpan={5} role="alert">{error}</td></tr> : null}
-      {!loading && !error && lowStock.map((product) => <tr key={product.id}><td>{product.name}</td><td>{product.sku}</td><td>{product.stock_quantity}</td><td>{product.minimum_stock_level}</td><td><span className={`status-badge ${stockClass(product.stock_quantity === 0 ? 'Out of Stock' : 'Low Stock')}`}>{product.stock_quantity === 0 ? 'Out of Stock' : 'Low Stock'}</span></td></tr>)}
+      {error ? <tr><td colSpan={5}><span role="alert">{errorMessage}</span></td></tr> : null}
+      {!loading && !error && lowStock.map((product) => {
+        const label = product.stock_quantity === 0 ? 'Out of Stock' : 'Low Stock'
+        return <tr key={product.id}><td>{product.name}</td><td>{product.sku}</td><td>{product.stock_quantity}</td><td>{product.minimum_stock_level}</td><td><span className={`status-badge ${label === 'Out of Stock' ? 'danger' : 'warning'}`}>{label}</span></td></tr>
+      })}
       {!loading && !error && lowStock.length === 0 ? <tr><td colSpan={5}>No low-stock products.</td></tr> : null}
     </tbody></table></div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
   </>
 }
 
 function ReportsPage({ token }: { token: string }) {
   const [sales, setSales] = useState<Array<{ period: string; orders: number; revenue: number }>>([])
   const [bestSellers, setBestSellers] = useState<Array<{ name: string; quantity: number; revenue: number }>>([])
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(true)
+  // Each report carries its own error: the products report is administrator only,
+  // so a shared Promise.all previously discarded the authorised sales report too.
+  const [salesError, setSalesError] = useState('')
+  const [productsError, setProductsError] = useState('')
+  const [loadingSales, setLoadingSales] = useState(true)
+  const [loadingProducts, setLoadingProducts] = useState(true)
 
   useEffect(() => {
-    void Promise.all([
-      apiFetch<{ sales: Array<{ period: string; orders: number; revenue: number }> }>('/v1/reports/sales?group=month', {}, token),
-      apiFetch<{ best_sellers: Array<{ name: string; quantity: number; revenue: number }> }>('/v1/reports/products', {}, token),
-    ]).then(([salesResponse, productsResponse]) => {
-      setSales(salesResponse.sales)
-      setBestSellers(productsResponse.best_sellers)
-    }).catch((requestError) => {
-      setError(requestError instanceof Error ? requestError.message : 'Unable to load reports.')
-    }).finally(() => setLoading(false))
+    const controller = new AbortController()
+
+    void apiFetch<{ sales: Array<{ period: string; orders: number; revenue: number }> }>('/v1/reports/sales?group=month', { signal: controller.signal }, token)
+      .then((response) => {
+        if (controller.signal.aborted) return
+        setSales(response.sales)
+        setSalesError('')
+      })
+      .catch((requestError) => {
+        if (controller.signal.aborted) return
+        setSalesError(describeError(requestError, 'Unable to load the sales report.'))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingSales(false)
+      })
+
+    void apiFetch<{ best_sellers: Array<{ name: string; quantity: number; revenue: number }> }>('/v1/reports/products', { signal: controller.signal }, token)
+      .then((response) => {
+        if (controller.signal.aborted) return
+        setBestSellers(response.best_sellers)
+        setProductsError('')
+      })
+      .catch((requestError) => {
+        if (controller.signal.aborted) return
+        setProductsError(describeError(requestError, 'Unable to load the product report.'))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingProducts(false)
+      })
+
+    return () => controller.abort()
   }, [token])
 
   return (
     <div className="panel report-panel">
       <h2>Sales overview</h2>
-      {loading ? <p>Loading reports...</p> : null}
-      {error ? <p role="alert">{error}</p> : null}
-      {!loading && !error ? <>
-        <h3>Monthly sales</h3>
-        <div className="table-panel"><table><thead><tr><th>Period</th><th>Orders</th><th>Revenue</th></tr></thead><tbody>
-          {sales.map((row) => <tr key={row.period}><td>{row.period}</td><td>{row.orders}</td><td>{formatCurrency(Number(row.revenue))}</td></tr>)}
-          {sales.length === 0 ? <tr><td colSpan={3}>No completed sales in this period.</td></tr> : null}
-        </tbody></table></div>
-        <h3>Best-selling products</h3>
-        <div className="table-panel"><table><thead><tr><th>Product</th><th>Units</th><th>Revenue</th></tr></thead><tbody>
-          {bestSellers.map((product) => <tr key={product.name}><td>{product.name}</td><td>{product.quantity}</td><td>{formatCurrency(Number(product.revenue))}</td></tr>)}
-          {bestSellers.length === 0 ? <tr><td colSpan={3}>No completed product sales yet.</td></tr> : null}
-        </tbody></table></div>
-      </> : null}
+
+      <h3>Monthly sales</h3>
+      {loadingSales ? <p>Loading sales report...</p> : null}
+      {salesError ? <p role="alert">{salesError}</p> : null}
+      {!loadingSales && !salesError ? <div className="table-panel"><table><thead><tr><th>Period</th><th>Orders</th><th>Revenue</th></tr></thead><tbody>
+        {sales.map((row) => <tr key={row.period}><td>{row.period}</td><td>{row.orders}</td><td>{formatCurrency(toNumber(row.revenue))}</td></tr>)}
+        {sales.length === 0 ? <tr><td colSpan={3}>No completed sales in this period.</td></tr> : null}
+      </tbody></table></div> : null}
+
+      <h3>Best-selling products</h3>
+      {loadingProducts ? <p>Loading product report...</p> : null}
+      {productsError ? <p role="alert">{productsError}</p> : null}
+      {!loadingProducts && !productsError ? <div className="table-panel"><table><thead><tr><th>Product</th><th>Units</th><th>Revenue</th></tr></thead><tbody>
+        {bestSellers.map((product) => <tr key={product.name}><td>{product.name}</td><td>{product.quantity}</td><td>{formatCurrency(toNumber(product.revenue))}</td></tr>)}
+        {bestSellers.length === 0 ? <tr><td colSpan={3}>No completed product sales yet.</td></tr> : null}
+      </tbody></table></div> : null}
     </div>
   )
 }
 
-function UsersPage({ token }: { token: string }) {
-  const { result, error, loading, reload } = useApiList<UserRecord>('users', token, '')
+function UsersPage({ token }: PageProps) {
+  const { result, error, errorMessage, loading, page, setPage, reload } = useApiList<UserRecord>('users', token, '')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [mutationError, setMutationError] = useState('')
+  const { fieldError, formError, reset, capture } = useFormErrors()
 
   const createUser = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const values = new FormData(event.currentTarget)
     setSaving(true)
-    setMutationError('')
+    reset()
     try {
       await apiFetch('/v1/users', {
         method: 'POST',
@@ -1232,19 +1485,19 @@ function UsersPage({ token }: { token: string }) {
       setFormOpen(false)
       reload()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to create user.')
+      capture(requestError, 'Unable to create user.')
     } finally {
       setSaving(false)
     }
   }
 
   const updateUser = async (user: UserRecord, changes: Partial<Pick<UserRecord, 'role' | 'is_active'>>) => {
-    setMutationError('')
+    reset()
     try {
       await apiFetch(`/v1/users/${user.id}`, { method: 'PATCH', body: JSON.stringify(changes) }, token)
       reload()
     } catch (requestError) {
-      setMutationError(requestError instanceof Error ? requestError.message : 'Unable to update user.')
+      capture(requestError, 'Unable to update user.')
     }
   }
 
@@ -1252,13 +1505,17 @@ function UsersPage({ token }: { token: string }) {
     <>
     <div className="page-header-row page-header-stack"><div><p className="eyebrow">Administration</p><h1>Users</h1><p className="page-subtitle">Manage account access and roles.</p></div><button type="button" className="primary-button" onClick={() => setFormOpen((open) => !open)}>{formOpen ? 'Cancel' : '+ Add User'}</button></div>
     {formOpen ? <form className="resource-form panel" onSubmit={createUser}>
-      <label>Name<input name="name" required maxLength={255} /></label><label>Email<input name="email" type="email" required /></label>
+      <label>Name<input name="name" required maxLength={255} aria-describedby={fieldError('name') ? 'user-name-error' : undefined} /></label>
+      <FieldError id="user-name-error" message={fieldError('name')} />
+      <label>Email<input name="email" type="email" required aria-describedby={fieldError('email') ? 'user-email-error' : undefined} /></label>
+      <FieldError id="user-email-error" message={fieldError('email')} />
       <label>Role<select name="role" defaultValue="employee"><option value="employee">Employee</option><option value="administrator">Administrator</option></select></label>
-      <label>Password<input name="password" type="password" autoComplete="new-password" required minLength={8} /></label>
+      <label>Password<input name="password" type="password" autoComplete="new-password" required minLength={8} aria-describedby={fieldError('password') ? 'user-password-error' : undefined} /></label>
+      <FieldError id="user-password-error" message={fieldError('password')} />
       <label>Confirm password<input name="password_confirmation" type="password" autoComplete="new-password" required minLength={8} /></label>
-      {mutationError ? <p role="alert">{mutationError}</p> : null}<button type="submit" className="primary-button" disabled={saving}>{saving ? 'Saving...' : 'Create user'}</button>
+      {formError ? <p role="alert">{formError}</p> : null}<button type="submit" className="primary-button" disabled={saving}>{saving ? 'Saving...' : 'Create user'}</button>
     </form> : null}
-    {mutationError && !formOpen ? <p className="auth-error" role="alert">{mutationError}</p> : null}
+    {formError && !formOpen ? <p className="auth-error" role="alert">{formError}</p> : null}
     <div className="panel table-panel">
       <table>
         <thead>
@@ -1273,69 +1530,127 @@ function UsersPage({ token }: { token: string }) {
         </thead>
         <tbody>
           {loading ? <tr><td colSpan={6}>Loading users...</td></tr> : null}
-          {error ? <tr><td colSpan={6} role="alert">{error}</td></tr> : null}
+          {error ? <tr><td colSpan={6}><span role="alert">{errorMessage}</span></td></tr> : null}
           {!loading && !error && result?.data.map((user) => <tr key={user.id}>
-            <td>{user.name}</td><td>{user.email}</td><td>{user.role}</td>
+            <td>{user.name}</td><td>{user.email}</td><td>{statusLabel(user.role)}</td>
             <td><span className={`status-badge ${user.is_active ? 'success' : 'neutral'}`}>{user.is_active ? 'Active' : 'Inactive'}</span></td>
-            <td>{new Date(user.created_at).toLocaleDateString()}</td>
+            <td>{formatDate(user.created_at)}</td>
             <td><div className="user-admin-actions"><select aria-label={`Role for ${user.name}`} value={user.role} onChange={(event) => void updateUser(user, { role: event.target.value })}><option value="administrator">Administrator</option><option value="employee">Employee</option></select><button type="button" className="table-action" onClick={() => void updateUser(user, { is_active: !user.is_active })}>{user.is_active ? 'Disable' : 'Enable'}</button></div></td>
           </tr>)}
           {!loading && !error && result?.data.length === 0 ? <tr><td colSpan={6}>No users found.</td></tr> : null}
         </tbody>
       </table>
     </div>
+    <Pagination
+      currentPage={result?.current_page ?? page}
+      lastPage={result?.last_page ?? 1}
+      total={result?.total ?? 0}
+      loading={loading}
+      onPageChange={setPage}
+    />
     </>
   )
 }
 
-function RolesPage() {
+/**
+ * Roles and permissions, read from GET /v1/roles.
+ *
+ * The matrix used to be hardcoded markup showing the same answer for every user.
+ * It is now sourced from the `role:` middleware the backend actually applies, so
+ * it cannot disagree with the enforced authorization.
+ */
+function RolesPage({ token }: { token: string }) {
+  const [capabilities, setCapabilities] = useState<RoleCapability[]>([])
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const controller = new AbortController()
+
+    void apiFetch<{ data: RoleCapability[] }>('/v1/roles', { signal: controller.signal }, token)
+      .then((response) => {
+        if (controller.signal.aborted) return
+        setCapabilities(response.data)
+        setError('')
+      })
+      .catch((requestError) => {
+        if (controller.signal.aborted) return
+        setError(describeError(requestError, 'Unable to load the permission matrix.'))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+
+    return () => controller.abort()
+  }, [token])
+
+  const roles = ['administrator', 'employee'] as const
+
   return (
     <div className="panel permissions-panel">
-      <h2>Roles & Permissions</h2>
-      <table className="permissions-table">
+      <h2>Roles &amp; Permissions</h2>
+      <p className="page-subtitle">
+        Derived from the access rules enforced by the API. The server is the source of truth; this view only
+        reflects it.
+      </p>
+
+      {loading ? <p>Loading permissions...</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+
+      {!loading && !error ? <table className="permissions-table">
         <thead>
           <tr>
             <th>Module</th>
-            <th>Admin</th>
-            <th>Employee</th>
+            {roles.map((role) => <th key={role}>{statusLabel(role)}</th>)}
           </tr>
         </thead>
         <tbody>
-          <tr><td>Dashboard</td><td>✓</td><td>✓</td></tr>
-          <tr><td>Customers</td><td>✓</td><td>✓</td></tr>
-          <tr><td>Products</td><td>✓</td><td>✓</td></tr>
-          <tr><td>Orders</td><td>✓</td><td>✓</td></tr>
-          <tr><td>Invoices</td><td>✓</td><td>✓</td></tr>
-          <tr><td>Users</td><td>✓</td><td>✕</td></tr>
-          <tr><td>Audit Logs</td><td>✓</td><td>✕</td></tr>
+          {capabilities.map((capability) => <tr key={capability.key}>
+            <td>{capability.label}</td>
+            {roles.map((role) => {
+              const granted = capability.permissions[role] ?? false
+              const restricted = capability.restricted[role] ?? false
+              const text = granted ? (restricted ? '✓ (limited)' : '✓') : '✕'
+
+              return <td key={role} title={restricted ? 'Some actions in this module require a higher role.' : undefined}>{text}</td>
+            })}
+          </tr>)}
+          {capabilities.length === 0 ? <tr><td colSpan={3}>No capabilities reported.</td></tr> : null}
         </tbody>
-      </table>
+      </table> : null}
     </div>
   )
 }
 
 function AuditPage({ token }: { token: string }) {
-  const { result, error, loading } = useApiList<AuditRecord>('audit-logs', token, '')
+  const { result, error, errorMessage, loading, page, setPage } = useApiList<AuditRecord>('audit-logs', token, '')
 
   return (
     <div className="panel table-panel">
       <h2>Audit Logs</h2>
       <div className="audit-list">
         {loading ? <p>Loading audit logs...</p> : null}
-        {error ? <p role="alert">{error}</p> : null}
+        {error ? <p role="alert">{errorMessage}</p> : null}
         {!loading && !error && result?.data.map((entry) => (
           <div key={entry.id} className="audit-row">
-            <div className="avatar avatar-xs">{(entry.user?.name ?? 'S').slice(0, 1).toUpperCase()}</div>
+            <div className="avatar avatar-xs">{initials(entry.user?.name ?? 'S').slice(0, 1)}</div>
             <div>
               <strong>
-                {entry.user?.name ?? 'System'} {entry.action} {entry.entity}{entry.entity_id ? ` #${entry.entity_id}` : ''}
+                {entry.user?.name ?? 'System'} {statusLabel(entry.action)} {entry.entity}{entry.entity_id ? ` #${entry.entity_id}` : ''}
               </strong>
-              <small>{new Date(entry.created_at).toLocaleString()}</small>
+              <small>{formatDateTime(entry.created_at)}</small>
             </div>
           </div>
         ))}
         {!loading && !error && result?.data.length === 0 ? <p>No audit activity yet.</p> : null}
       </div>
+      <Pagination
+        currentPage={result?.current_page ?? page}
+        lastPage={result?.last_page ?? 1}
+        total={result?.total ?? 0}
+        loading={loading}
+        onPageChange={setPage}
+      />
     </div>
   )
 }
@@ -1349,7 +1664,7 @@ function SettingsPage({ token }: { token: string }) {
 
   useEffect(() => {
     void apiFetch<SettingRecord[]>('/v1/settings', {}, token).then(setSettings).catch((requestError) => {
-      setError(requestError instanceof Error ? requestError.message : 'Unable to load settings.')
+      setError(describeError(requestError, 'Unable to load settings.'))
     }).finally(() => setLoading(false))
   }, [token])
 
@@ -1366,7 +1681,7 @@ function SettingsPage({ token }: { token: string }) {
       setSettings(updated)
       setSaved(true)
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Unable to save settings.')
+      setError(describeError(requestError, 'Unable to save settings.'))
     } finally {
       setSaving(false)
     }
@@ -1419,12 +1734,21 @@ function RevenueChart({ data }: { data: number[] }) {
   )
 }
 
+/**
+ * Daily order counts.
+ *
+ * The grid is defined by the data length, not a hardcoded twelve columns: the
+ * dashboard endpoint returns up to 30 points, which previously overflowed the
+ * panel.
+ */
 function SalesChart({ data }: { data: number[] }) {
   const max = Math.max(...data, 1)
+  const columns = Math.max(data.length, 1)
+
   return (
-    <div className="mini-bars" aria-label="Sales chart">
+    <div className="mini-bars" aria-label="Sales chart" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
       {data.map((value, index) => (
-        <div key={index} className="mini-bar-wrap">
+        <div key={index} className="mini-bar-wrap" title={`${value} orders`}>
           <div className="mini-bar" style={{ height: `${Math.max((value / max) * 100, 2)}%` }} />
         </div>
       ))}
@@ -1462,45 +1786,6 @@ function renderIcon(key: string) {
     default:
       return <GaugeIcon />
   }
-}
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'EUR',
-    maximumFractionDigits: 0,
-  }).format(value)
-}
-
-function formatNumber(value: number) {
-  return new Intl.NumberFormat('en-US').format(value)
-}
-
-function initials(name: string) {
-  return name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join('')
-}
-
-function parseSettingValue(value: unknown) {
-  if (typeof value !== 'string') return value
-  try {
-    return JSON.parse(value) as unknown
-  } catch {
-    return value
-  }
-}
-
-function statusClass(value: string) {
-  const normalized = value.toLowerCase()
-  if (normalized.includes('paid') || normalized.includes('completed') || normalized.includes('active') || normalized.includes('vip')) return 'success'
-  if (normalized.includes('pending') || normalized.includes('processing') || normalized.includes('low')) return 'warning'
-  if (normalized.includes('inactive') || normalized.includes('out')) return 'danger'
-  return 'neutral'
-}
-
-function stockClass(value: string) {
-  if (value === 'In Stock') return 'success'
-  if (value === 'Low Stock') return 'warning'
-  return 'danger'
 }
 
 function SearchIcon() {

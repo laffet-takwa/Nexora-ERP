@@ -13,7 +13,13 @@ class OrderItem extends Model
 
     protected function casts(): array
     {
-        return ['unit_price' => 'decimal:3', 'discount' => 'decimal:3', 'tax_rate' => 'decimal:2', 'line_total' => 'decimal:3'];
+        return [
+            'quantity' => 'integer',
+            'unit_price' => 'decimal:3',
+            'discount' => 'decimal:3',
+            'tax_rate' => 'decimal:2',
+            'line_total' => 'decimal:3',
+        ];
     }
 
     public function order()

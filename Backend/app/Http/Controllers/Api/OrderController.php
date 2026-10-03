@@ -6,9 +6,11 @@ use App\Http\Controllers\Controller;
 use App\Models\InventoryMovement;
 use App\Models\Order;
 use App\Models\Product;
+use App\Models\SystemSetting;
 use App\Services\AuditLogger;
 use App\Services\BusinessNotifier;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -26,10 +28,16 @@ class OrderController extends Controller
             $query->where('status', $request->query('status'));
         }
         if ($request->filled('from')) {
-            $query->whereDate('created_at', '>=', $request->query('from'));
+            // Half-open range comparison keeps the (status, created_at) index usable.
+            $from = Carbon::parse($request->query('from'))->startOfDay();
+            $to = $request->filled('to')
+                ? Carbon::parse($request->query('to'))->endOfDay()
+                : $from->copy()->endOfDay();
+            $query->whereBetween('created_at', [$from, $to]);
         }
-        if ($request->filled('to')) {
-            $query->whereDate('created_at', '<=', $request->query('to'));
+        if ($request->filled('to') && ! $request->filled('from')) {
+            $day = Carbon::parse($request->query('to'));
+            $query->whereBetween('created_at', [$day->copy()->startOfDay(), $day->endOfDay()]);
         }
 
         return $query->latest()->paginate(min(max((int) $request->query('per_page', 15), 1), 100));
@@ -45,15 +53,30 @@ class OrderController extends Controller
             'items.*.product_id' => ['required', 'integer', 'distinct', 'exists:products,id'],
             'items.*.quantity' => ['required', 'integer', 'min:1'],
             'items.*.discount' => ['sometimes', 'numeric', 'min:0'],
-            'items.*.tax_rate' => ['sometimes', 'numeric', 'between:0,100'],
+            'items.*.tax_rate' => ['sometimes', 'numeric'],
         ]);
 
-        $order = DB::transaction(function () use ($data, $request): Order {
+        $allowedTaxRates = $this->allowedTaxRates();
+        $defaultTaxRate = $allowedTaxRates[0];
+
+        $order = DB::transaction(function () use ($data, $allowedTaxRates, $defaultTaxRate, $request): Order {
+            // Lock in ascending id order so two concurrent orders touching the same
+            // products cannot deadlock by acquiring the same rows in opposite order.
+            $productIds = collect($data['items'])->pluck('product_id')->sort()->values()->all();
+            $products = Product::query()->whereIn('id', $productIds)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('id');
+
             $lines = [];
             $subtotal = 0.0;
             $taxTotal = 0.0;
             foreach ($data['items'] as $line) {
-                $product = Product::query()->lockForUpdate()->findOrFail($line['product_id']);
+                $product = $products[$line['product_id']] ?? null;
+                if (! $product) {
+                    throw ValidationException::withMessages(['items' => 'Unknown product in order.']);
+                }
                 if ($product->status !== 'active') {
                     throw ValidationException::withMessages(['items' => "Product {$product->sku} is inactive."]);
                 }
@@ -61,13 +84,20 @@ class OrderController extends Controller
                     throw ValidationException::withMessages(['items' => "Insufficient stock for product {$product->sku}."]);
                 }
 
+                // The backend owns the tax rate; a client may only pick a configured one.
+                if (array_key_exists('tax_rate', $line) && ! in_array(round((float) $line['tax_rate'], 2), $allowedTaxRates, true)) {
+                    throw ValidationException::withMessages([
+                        'items' => 'The requested tax rate is not configured. Allowed rates: '.implode(', ', $allowedTaxRates).'.',
+                    ]);
+                }
+                $rate = round((float) ($line['tax_rate'] ?? $defaultTaxRate), 2);
+
                 $gross = (float) $product->selling_price * $line['quantity'];
                 $lineDiscount = (float) ($line['discount'] ?? 0);
                 if ($lineDiscount > $gross) {
                     throw ValidationException::withMessages(['items' => "Discount exceeds the value of product {$product->sku}."]);
                 }
                 $net = $gross - $lineDiscount;
-                $rate = (float) ($line['tax_rate'] ?? 0);
                 $lineTax = round($net * $rate / 100, 3);
                 $subtotal += $net;
                 $taxTotal += $lineTax;
@@ -118,6 +148,31 @@ class OrderController extends Controller
         return response()->json($order->load(['customer', 'items']), 201);
     }
 
+    /**
+     * Tax rates the server is willing to apply.
+     *
+     * Authoritative source is the `finance.tax_rates` system setting. With nothing
+     * configured the only permitted rate is 0, so a client can never invent a tax
+     * figure by omitting or guessing the field.
+     */
+    protected function allowedTaxRates(): array
+    {
+        $configured = SystemSetting::query()->where('key', 'finance.tax_rates')->value('value');
+
+        if (! is_array($configured)) {
+            return [0.0];
+        }
+
+        $rates = array_values(array_unique(array_map(
+            fn ($rate) => round((float) $rate, 2),
+            array_filter($configured, fn ($rate) => is_numeric($rate) && (float) $rate >= 0 && (float) $rate <= 100),
+        )));
+
+        sort($rates);
+
+        return $rates === [] ? [0.0] : $rates;
+    }
+
     public function show(Order $order)
     {
         return $order->load(['customer', 'items.product', 'invoice.payments', 'creator']);
@@ -152,7 +207,7 @@ class OrderController extends Controller
             }
 
             if ($newStatus === 'completed') {
-                foreach ($lockedOrder->items as $item) {
+                foreach ($lockedOrder->items->sortBy('product_id')->values() as $item) {
                     $product = Product::query()->lockForUpdate()->findOrFail($item->product_id);
                     if ($product->stock_quantity < $item->quantity) {
                         throw ValidationException::withMessages(['stock' => "Insufficient stock for product {$product->sku}."]);
@@ -163,6 +218,7 @@ class OrderController extends Controller
                         'user_id' => $request->user()->id,
                         'type' => 'out',
                         'quantity' => $item->quantity,
+                        'delta' => -$item->quantity,
                         'quantity_after' => $product->fresh()->stock_quantity,
                         'reason' => 'Order '.$lockedOrder->order_number,
                     ]);
@@ -175,7 +231,10 @@ class OrderController extends Controller
         $audit->record($request, 'status_changed', 'order', $order->id, ['status' => $newStatus]);
         if ($newStatus === 'completed') {
             foreach ($order->fresh()->load('items.product')->items as $item) {
-                if ($item->product && $item->product->stock_quantity <= $item->product->minimum_stock_level) {
+                // A threshold of 0 means "no reorder point", not "always out of stock".
+                if ($item->product
+                    && $item->product->minimum_stock_level > 0
+                    && $item->product->stock_quantity <= $item->product->minimum_stock_level) {
                     $notifier->notifyAdministrators('low_stock', 'Product '.$item->product->name.' is low in stock.', ['product_id' => $item->product_id]);
                 }
             }

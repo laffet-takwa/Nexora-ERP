@@ -12,6 +12,7 @@ use App\Http\Controllers\Api\OrderController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\ReportController;
+use App\Http\Controllers\Api\RoleController;
 use App\Http\Controllers\Api\SystemSettingController;
 use App\Http\Controllers\Api\UserController;
 use Illuminate\Support\Facades\Route;
@@ -52,12 +53,14 @@ Route::prefix('v1')->group(function (): void {
         Route::get('/orders/{order}', [OrderController::class, 'show']);
         Route::patch('/orders/{order}/status', [OrderController::class, 'updateStatus']);
 
-        Route::get('/invoices', [InvoiceController::class, 'index']);
-        Route::post('/invoices', [InvoiceController::class, 'store']);
-        Route::get('/invoices/{invoice}', [InvoiceController::class, 'show']);
+Route::get('/invoices', [InvoiceController::class, 'index']);
+    Route::post('/invoices', [InvoiceController::class, 'store']);
+    Route::get('/invoices/{invoice}', [InvoiceController::class, 'show']);
+    Route::post('/invoices/{invoice}/void', [InvoiceController::class, 'void'])->middleware('role:administrator');
 
-        Route::get('/payments', [PaymentController::class, 'index']);
-        Route::post('/payments', [PaymentController::class, 'store']);
+    Route::get('/payments', [PaymentController::class, 'index']);
+    Route::post('/payments', [PaymentController::class, 'store']);
+    Route::post('/payments/{payment}/refund', [PaymentController::class, 'refund'])->middleware('role:administrator');
 
         Route::get('/inventory', [InventoryController::class, 'index']);
         Route::get('/inventory/movements', [InventoryController::class, 'movements']);
@@ -72,6 +75,11 @@ Route::prefix('v1')->group(function (): void {
             Route::get('/audit-logs', [AuditLogController::class, 'index']);
             Route::get('/settings', [SystemSettingController::class, 'index']);
             Route::put('/settings', [SystemSettingController::class, 'update']);
+
+            // Role capabilities are served by the backend so the UI never has to
+            // hardcode what each role may do.
+            Route::get('/roles', [RoleController::class, 'index']);
+            Route::get('/roles/{role}/permissions', [RoleController::class, 'show']);
         });
     });
 });
